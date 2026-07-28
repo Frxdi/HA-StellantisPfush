@@ -150,7 +150,13 @@ class StellantisVehiclesConfigFlow(ConfigFlow, domain=DOMAIN):
             return self.async_show_form(step_id="oauth_remote", data_schema=OAUTH_REMOTE_SCHEMA(self.data.get(FIELD_OAUTH_CODE_URL)), description_placeholders=TRANSLATION_PLACEHOLDERS)
 
         try:
-            code_request = await self.stellantis.get_oauth_code(user_input[CONF_EMAIL], user_input[CONF_PASSWORD], user_input.get(FIELD_OAUTH_CODE_URL, OAUTH_CODE_URL))
+            code_request = await self.stellantis.get_oauth_code(
+                user_input[CONF_EMAIL],
+                user_input[CONF_PASSWORD],
+                user_input.get(FIELD_OAUTH_CODE_URL, OAUTH_CODE_URL),
+                self.data[FIELD_MOBILE_APP],
+                self.data[FIELD_COUNTRY_CODE]
+            )
         except Exception as e:
             message = self.get_error_message("get_oauth_code", e)
             if self.source == SOURCE_RECONFIGURE:
