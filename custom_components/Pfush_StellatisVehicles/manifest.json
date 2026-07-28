@@ -1,17 +1,17 @@
 {
   "domain": "stellantis_vehicles",
-  "name": "Stellantis Vehicles",
+  "name": "PfushStellantis Vehicles",
   "codeowners": [
-    "@andreadegiovine"
+    "@Frxdi"
   ],
   "config_flow": true,
   "dependencies": [
     "webhook",
     "http"
   ],
-  "documentation": "https://github.com/andreadegiovine/homeassistant-stellantis-vehicles",
+  "documentation": "https://github.com/Frxdi/HA-StellantisPfush",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/andreadegiovine/homeassistant-stellantis-vehicles/issues",
+  "issue_tracker": "https://github.com/Frxdi/HA-StellantisPfush/issues",
   "requirements": [
     "Pillow==12.*",
     "pycryptodome==3.*",
