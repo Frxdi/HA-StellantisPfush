@@ -293,9 +293,26 @@ class StellantisOauth(StellantisBase):
     def get_oauth_url(self):
         return self.apply_query_params(OAUTH_AUTHORIZE_URL, OAUTH_AUTHORIZE_QUERY_PARAMS)
 
-    async def get_oauth_code(self, email, password, code_url=None):
+    async def get_oauth_code(self, email, password, code_url=None, mobile_app=None, country_code=None):
         _LOGGER.debug("---------- START get_oauth_code")
-        oauth_code_request = await self.make_http_request(code_url or OAUTH_CODE_URL, 'POST', None, None, {"url": self.get_oauth_url(), "email": email, "password": password}, None, 300)
+        code_url = code_url or OAUTH_CODE_URL
+        if "stelloauth" in code_url.lower():
+            # stelloauth (https://github.com/tamcore/stelloauth) exposes a different
+            # request/response format than the default worker service: it expects the
+            # brand/country instead of the authorize url, and nests the code under "data".
+            oauth_code_request = await self.make_http_request(
+                code_url.rstrip("/") + "/oauth",
+                'POST',
+                None,
+                None,
+                {"brand": mobile_app, "country": country_code, "email": email, "password": password},
+                None,
+                300
+            )
+            if "data" in oauth_code_request and "code" in oauth_code_request["data"]:
+                oauth_code_request["code"] = oauth_code_request["data"]["code"]
+        else:
+            oauth_code_request = await self.make_http_request(code_url, 'POST', None, None, {"url": self.get_oauth_url(), "email": email, "password": password}, None, 300)
         if "code" in oauth_code_request:
             self.logger_filter.add_custom_value(oauth_code_request["code"])
         _LOGGER.debug(oauth_code_request)
