@@ -1,0 +1,236 @@
+import logging
+import shutil
+import os
+
+from homeassistant.core import HomeAssistant
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import issue_registry
+from homeassistant.components.frontend import add_extra_js_url
+from homeassistant.components.http import StaticPathConfig
+
+from .stellantis import StellantisVehicles
+from .exceptions import ComunicationError
+from .config_flow import StellantisVehiclesConfigFlow
+
+from .const import (
+    DOMAIN,
+    INTEGRATION_VERSION,
+    PLATFORMS,
+    OTP_FILENAME,
+    FIELD_NOTIFICATIONS
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+async def async_setup_entry(hass: HomeAssistant, config: ConfigEntry):
+
+    stellantis = StellantisVehicles(hass)
+    stellantis.save_config(config.data)
+    stellantis.set_entry(config)
+    await stellantis.scheduled_tokens_refresh()
+
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN][config.entry_id] = stellantis
+
+    try:
+        vehicles = await stellantis.get_user_vehicles()
+    except (ConfigEntryAuthFailed, ComunicationError):
+        raise
+    except Exception:
+        vehicles = {}
+
+    if vehicles:
+        await hass.config_entries.async_forward_entry_setups(config, PLATFORMS)
+    else:
+        _LOGGER.warning("No vehicles found for this account")
+        await stellantis.hass_notify("no_vehicles_found")
+        await stellantis.close_session()
+
+    for vehicle in vehicles:
+        coordinator = await stellantis.async_get_coordinator(vehicle)
+        await coordinator.async_config_entry_first_refresh()
+
+    url = f"/stellantis_vehicles/{INTEGRATION_VERSION}/stellantis-vehicle-card.js"
+    if url not in hass.data["frontend_extra_module_url"].urls:
+        file_path = os.path.join(os.path.dirname(__file__), "frontend", "stellantis-vehicle-card.js")
+        await hass.http.async_register_static_paths([StaticPathConfig(url, str(file_path), False)])
+        add_extra_js_url(hass, url)
+
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, config: ConfigEntry) -> bool:
+    stellantis = hass.data[DOMAIN][config.entry_id]
+
+    if unload_ok := await hass.config_entries.async_unload_platforms(config, PLATFORMS):
+        if stellantis.remote_commands and stellantis._mqtt:
+            stellantis._mqtt.disconnect()
+
+        stellantis.reset_scheduled_tokens()
+
+        hass.data[DOMAIN].pop(config.entry_id)
+
+    return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, config: ConfigEntry) -> None:
+    if not hass.config_entries.async_loaded_entries(DOMAIN):
+
+        # Remove stale repairs (if any) - just in case this integration will use
+        # the issue registry in the future
+        issue_registry.async_delete_issue(hass, DOMAIN, DOMAIN)
+
+        # Remove any remaining disabled or ignored entries
+        for _entry in hass.config_entries.async_entries(DOMAIN):
+            hass.async_create_task(hass.config_entries.async_remove(_entry.entry_id))
+
+        # Gennerate path to storage folder and OTP file
+        hass_config_path = hass.config.path()
+        storage_path = os.path.join(hass_config_path, ".storage", DOMAIN)
+        otp_file_path = os.path.join(storage_path, OTP_FILENAME)
+        otp_file_path = otp_file_path.replace("{#customer_id#}", config.unique_id)
+
+        # Remove OTP file if it exists
+        if os.path.isfile(otp_file_path):
+            _LOGGER.debug(f"Deleting OTP-File: {otp_file_path}")
+            os.remove(otp_file_path)
+
+        # Remove storage folder if empty
+        if os.path.exists(storage_path) and os.path.isdir(storage_path) and not os.listdir(storage_path):
+            _LOGGER.debug(f"Deleting empty Stellantis storage folder: {storage_path}")
+            shutil.rmtree(storage_path)
+
+        # Remove Stellantis image folder of this entry
+        entry_image_path = os.path.join(hass_config_path, "www", DOMAIN, config.unique_id)
+        if os.path.exists(entry_image_path) and os.path.isdir(entry_image_path):
+            _LOGGER.debug(f"Deleting Stellantis entry image folder: {entry_image_path}")
+            shutil.rmtree(entry_image_path)
+
+        # Remove Stellantis image folder if empty
+        image_path = os.path.join(hass_config_path, "www", DOMAIN)
+        if os.path.exists(image_path) and os.path.isdir(image_path) and not os.listdir(image_path):
+            _LOGGER.debug(f"Deleting Stellantis image folder: {image_path}")
+            shutil.rmtree(image_path)
+
+
+async def async_migrate_entry(hass: HomeAssistant, config: ConfigEntry):
+    # Migrate config prior 1.2 to 1.2 - unique_id and file structure
+    if config.version == 1 and config.minor_version < 2:
+        _LOGGER.debug("Migrating configuration from version %s.%s", config.version, config.minor_version)
+        # update unique_id with customer_id - used to be data[FIELD_MOBILE_APP].lower()+str(self.data["access_token"][:5])
+        new_unique_id = config.data.get("customer_id")
+        if config.unique_id != new_unique_id:
+            _LOGGER.debug(f"Migrating unique_id from {config.unique_id} to {new_unique_id}")
+            hass.config_entries.async_update_entry(config, unique_id=new_unique_id)
+        # Migrate to new file structure - Generate path to storage folder and move OTP file
+        hass_config_path = hass.config.path()
+        old_otp_file_path = os.path.join(hass_config_path, ".storage/stellantis_vehicles_otp.pickle")
+        if os.path.isfile(old_otp_file_path):
+            new_storage_path = os.path.join(hass_config_path, ".storage", DOMAIN)
+            new_otp_file_path = os.path.join(new_storage_path, OTP_FILENAME)
+            new_otp_file_path = new_otp_file_path.replace("{#customer_id#}", new_unique_id)
+            if not os.path.isdir(new_storage_path):
+                os.mkdir(new_storage_path)
+            if not os.path.isfile(new_otp_file_path):
+                _LOGGER.debug(f"Migrating OTP file to new storage path from {old_otp_file_path} to {new_otp_file_path}")
+                os.rename(old_otp_file_path, new_otp_file_path)
+            else:
+                os.remove(old_otp_file_path)
+        # Update config entry object
+        hass.config_entries.async_update_entry(config, version=StellantisVehiclesConfigFlow.VERSION, minor_version=StellantisVehiclesConfigFlow.MINOR_VERSION)
+        _LOGGER.debug("Migration to configuration version %s.%s successful", config.version, config.minor_version)
+
+    if config.version == 1 and config.minor_version < 3:
+        _LOGGER.debug("Migrating configuration from version %s.%s", config.version, config.minor_version)
+        public_path = hass.config.path("www")
+        old_image_path = f"{public_path}/stellantis-vehicles"
+        if os.path.isdir(old_image_path):
+            _LOGGER.debug(f"Deleting Stellantis old image folder: {old_image_path}")
+            shutil.rmtree(old_image_path)
+        hass.config_entries.async_update_entry(config, version=StellantisVehiclesConfigFlow.VERSION, minor_version=StellantisVehiclesConfigFlow.MINOR_VERSION)
+        _LOGGER.debug("Migration to configuration version %s.%s successful", config.version, config.minor_version)
+
+    if config.version == 1 and config.minor_version < 4:
+        _LOGGER.debug("Migrating configuration from version %s.%s", config.version, config.minor_version)
+        data = dict(config.data)
+        data["oauth"] = {
+            "access_token": data["access_token"],
+            "refresh_token": data["refresh_token"],
+            "expires_in": data["expires_in"]
+        }
+        data.pop("access_token", None)
+        data.pop("refresh_token", None)
+        data.pop("expires_in", None)
+        hass.config_entries.async_update_entry(config, data=data, version=StellantisVehiclesConfigFlow.VERSION, minor_version=StellantisVehiclesConfigFlow.MINOR_VERSION)
+        _LOGGER.debug("Migration to configuration version %s.%s successful", config.version, config.minor_version)
+
+    if config.version == 1 and config.minor_version < 5:
+        _LOGGER.debug("Migrating configuration from version %s.%s", config.version, config.minor_version)
+        data = dict(config.data)
+
+        def update_data(data):
+            public_path = hass.config.path("www")
+            customer_id = data["customer_id"]
+            entry_path = f"{public_path}/{DOMAIN}/{customer_id}"
+            if os.path.isdir(entry_path):
+                for vin in os.listdir(entry_path):
+                    vin_path = os.path.join(entry_path, vin)
+                    if os.path.isfile(vin_path):
+                        vin = os.path.splitext(vin)[0]
+                        data[vin] = {}
+                        if "text_abrp_token" in data:
+                            data[vin]["text_abrp_token"] = data["text_abrp_token"]
+                        if "number_battery_charging_limit" in data:
+                            data[vin]["number_battery_charging_limit"] = data["number_battery_charging_limit"]
+                        if "number_refresh_interval" in data:
+                            data[vin]["number_refresh_interval"] = data["number_refresh_interval"]
+                        if "switch_battery_charging_limit" in data:
+                            data[vin]["switch_battery_charging_limit"] = data["switch_battery_charging_limit"]
+                        if "switch_abrp_sync" in data:
+                            data[vin]["switch_abrp_sync"] = data["switch_abrp_sync"]
+                        if "switch_battery_values_correction" in data:
+                            data[vin]["switch_battery_values_correction"] = data["switch_battery_values_correction"]
+                        if "switch_notifications" in data:
+                            data[vin]["switch_notifications"] = data["switch_notifications"]
+            data.pop("text_abrp_token", None)
+            data.pop("number_battery_charging_limit", None)
+            data.pop("number_refresh_interval", None)
+            data.pop("switch_battery_charging_limit", None)
+            data.pop("switch_abrp_sync", None)
+            data.pop("switch_battery_values_correction", None)
+            data.pop("switch_notifications", None)
+            return data
+
+        new_data = await hass.async_add_executor_job(update_data, data)
+        hass.config_entries.async_update_entry(config, data=new_data, version=StellantisVehiclesConfigFlow.VERSION, minor_version=StellantisVehiclesConfigFlow.MINOR_VERSION)
+        _LOGGER.debug("Migration to configuration version %s.%s successful", config.version, config.minor_version)
+
+    if config.version == 1 and config.minor_version < 6:
+        _LOGGER.debug("Migrating configuration from version %s.%s", config.version, config.minor_version)
+        data = dict(config.data)
+
+        def update_data(data):
+            public_path = hass.config.path("www")
+            customer_id = data["customer_id"]
+            entry_path = f"{public_path}/{DOMAIN}/{customer_id}"
+            if os.path.isdir(entry_path):
+                for vin in os.listdir(entry_path):
+                    vin_path = os.path.join(entry_path, vin)
+                    if os.path.isfile(vin_path):
+                        vin = os.path.splitext(vin)[0]
+                        if vin in data and "switch_notifications" in data[vin]:
+                            data[FIELD_NOTIFICATIONS] = data[vin]["switch_notifications"]
+                            data[vin].pop("switch_notifications", None)
+            return data
+
+        new_data = await hass.async_add_executor_job(update_data, data)
+        hass.config_entries.async_update_entry(config, data=new_data, version=StellantisVehiclesConfigFlow.VERSION, minor_version=StellantisVehiclesConfigFlow.MINOR_VERSION)
+        _LOGGER.debug("Migration to configuration version %s.%s successful", config.version, config.minor_version)
+
+    # Global update of versions
+    if config.version < INTEGRATION_VERSION:
+        _LOGGER.debug("Entry version updated from %s.%s to %s.1", config.version, config.minor_version, INTEGRATION_VERSION)
+        hass.config_entries.async_update_entry(config, version=INTEGRATION_VERSION, minor_version=1)
+
+    return True
