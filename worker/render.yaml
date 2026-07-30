@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: stellantis-vehicles-worker
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
