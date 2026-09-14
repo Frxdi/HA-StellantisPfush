@@ -311,13 +311,22 @@ class StellantisOauth(StellantisBase):
         if "stelloauth" in code_url.lower():
             # stelloauth (https://github.com/tamcore/stelloauth) exposes a different
             # request/response format than the default worker service: it expects the
-            # brand/country instead of the authorize url, and nests the code under "data".
-            # It also streams its response as newline-delimited JSON
-            # (Content-Type: application/x-ndjson) with one progress/result object per
-            # line while the headless-browser login runs, instead of a single JSON body.
-            # aiohttp's resp.json() rejects that mimetype outright, so this request is
-            # handled separately: read the raw text and parse it line by line, keeping
-            # the last valid JSON object (the final result) instead of the whole body.
+            # brand/country instead of the authorize url, and streams its response as
+            # newline-delimited JSON (one line per event) while the headless-browser
+            # login runs, instead of a single JSON body. aiohttp's resp.json() rejects
+            # that mimetype outright, so this request is handled separately: read the
+            # raw text and parse it line by line.
+            #
+            # Each line is an *event envelope*, not the result itself:
+            #   {"type": "progress", "message": "..."}
+            #   {"type": "result", "data": {"status": "success", "data": {"code": "..."}}}
+            #   {"type": "result", "data": {"status": "error", "message": "..."}}
+            # Only the "result" event's "data" is the actual payload; "progress" events
+            # must be ignored. Using the raw last line as the payload (as before) picks
+            # up the *event envelope* itself, whose own top-level "code" field is just
+            # the fixed status label "OAUTH_CODE" - not the real authorization code -
+            # which made every automatic login send "OAUTH_CODE" to Stellantis instead
+            # of the actual code, reliably causing "invalid_grant".
             self.start_session()
             oauth_code_request = {}
             try:
@@ -337,8 +346,8 @@ class StellantisOauth(StellantisBase):
                             parsed_line = json.loads(line)
                         except ValueError:
                             continue
-                        if isinstance(parsed_line, dict):
-                            oauth_code_request = parsed_line
+                        if isinstance(parsed_line, dict) and parsed_line.get("type") == "result" and isinstance(parsed_line.get("data"), dict):
+                            oauth_code_request = parsed_line["data"]
                     if not str(resp.status).startswith("20"):
                         error = oauth_code_request.get("error") or oauth_code_request.get("message") or raw_text
                         _LOGGER.debug(f"POST request error {str(resp.status)}: {resp.url}")
@@ -354,6 +363,11 @@ class StellantisOauth(StellantisBase):
                 raise ComunicationError(e)
             if "data" in oauth_code_request and "code" in oauth_code_request["data"]:
                 oauth_code_request["code"] = oauth_code_request["data"]["code"]
+            elif oauth_code_request.get("status") != "success" or "code" not in oauth_code_request:
+                # The stream ended without a usable "result" event (e.g. a login/consent
+                # failure), so surface the actual message instead of silently continuing
+                # with a missing/incorrect code.
+                raise Exception(oauth_code_request.get("message") or "stelloauth did not return an OAuth code")
         else:
             oauth_code_request = await self.make_http_request(code_url, 'POST', None, None, {"url": self.get_oauth_url(), "email": email, "password": password}, None, 300)
         if "code" in oauth_code_request:
