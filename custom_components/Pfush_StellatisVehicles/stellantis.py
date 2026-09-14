@@ -300,15 +300,46 @@ class StellantisOauth(StellantisBase):
             # stelloauth (https://github.com/tamcore/stelloauth) exposes a different
             # request/response format than the default worker service: it expects the
             # brand/country instead of the authorize url, and nests the code under "data".
-            oauth_code_request = await self.make_http_request(
-                code_url.rstrip("/") + "/oauth",
-                'POST',
-                None,
-                None,
-                {"brand": mobile_app, "country": country_code, "email": email, "password": password},
-                None,
-                300
-            )
+            # It also streams its response as newline-delimited JSON
+            # (Content-Type: application/x-ndjson) with one progress/result object per
+            # line while the headless-browser login runs, instead of a single JSON body.
+            # aiohttp's resp.json() rejects that mimetype outright, so this request is
+            # handled separately: read the raw text and parse it line by line, keeping
+            # the last valid JSON object (the final result) instead of the whole body.
+            self.start_session()
+            oauth_code_request = {}
+            try:
+                _timeout = aiohttp.ClientTimeout(total=300)
+                async with self._session.request(
+                    'POST',
+                    code_url.rstrip("/") + "/oauth",
+                    json={"brand": mobile_app, "country": country_code, "email": email, "password": password},
+                    timeout=_timeout
+                ) as resp:
+                    raw_text = await resp.text()
+                    for line in raw_text.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            parsed_line = json.loads(line)
+                        except ValueError:
+                            continue
+                        if isinstance(parsed_line, dict):
+                            oauth_code_request = parsed_line
+                    if not str(resp.status).startswith("20"):
+                        error = oauth_code_request.get("error") or oauth_code_request.get("message") or raw_text
+                        _LOGGER.debug(f"POST request error {str(resp.status)}: {resp.url}")
+                        _LOGGER.debug(oauth_code_request)
+                        raise Exception(error)
+            except asyncio.TimeoutError as e:
+                await self.close_session()
+                _LOGGER.warning(f"Error: {e}")
+                raise ComunicationError("Request timeout")
+            except aiohttp.client_exceptions.ClientError as e:
+                await self.close_session()
+                _LOGGER.warning(f"Error: {e}")
+                raise ComunicationError(e)
             if "data" in oauth_code_request and "code" in oauth_code_request["data"]:
                 oauth_code_request["code"] = oauth_code_request["data"]["code"]
         else:
