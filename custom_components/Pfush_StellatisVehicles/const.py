@@ -62,7 +62,7 @@ OAUTH_AUTHORIZE_QUERY_PARAMS = {
     "client_id": "{#client_id#}",
     "response_type": "code",
     "redirect_uri": "{#scheme#}://oauth2redirect/{#culture#}",
-    "scope": "openid%20profile%20email",
+    "scope": "openid profile email",
     "locale": "{#locale#}"
 }
 
