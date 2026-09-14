@@ -1,6 +1,7 @@
 import logging
 import aiohttp
 import base64
+from urllib.parse import quote
 from PIL import Image, ImageOps
 import os
 from urllib.request import urlopen
@@ -191,10 +192,16 @@ class StellantisBase:
             vehicle = []
         query_params = []
         for key in params:
-            value = params[key]
-            query_params.append(f"{key}={value}")
+            # Resolve placeholders (e.g. {#oauth_code#}, {#oauth|refresh_token#}) first,
+            # then URL-encode the resolved value. Without this, codes/tokens containing
+            # characters like "+", "/" or "=" get sent raw in the query string and can be
+            # misinterpreted by the OAuth server (e.g. "+" decoded as a space), which makes
+            # an otherwise valid authorization/refresh token look invalid ("invalid_grant").
+            value = self.replace_placeholders(str(params[key]), vehicle)
+            query_params.append(f"{key}={quote(value, safe='')}")
         query_params = '&'.join(query_params)
-        return self.replace_placeholders(f"{url}?{query_params}", vehicle)
+        url = self.replace_placeholders(url, vehicle)
+        return f"{url}?{query_params}"
 
     async def make_http_request(self, url, method='GET', headers=None, params=None, json_data=None, data=None, timeout=60):
         _LOGGER.debug("---------- START make_http_request")
