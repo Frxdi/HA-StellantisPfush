@@ -198,7 +198,12 @@ class StellantisBase:
             # misinterpreted by the OAuth server (e.g. "+" decoded as a space), which makes
             # an otherwise valid authorization/refresh token look invalid ("invalid_grant").
             value = self.replace_placeholders(str(params[key]), vehicle)
-            query_params.append(f"{key}={quote(value, safe='')}")
+            encoded_value = quote(value, safe='')
+            if encoded_value != value:
+                # The encoded form differs from the raw one (e.g. oauth_code, refresh_token),
+                # so make sure debug-log masking still catches it in its encoded shape too.
+                self.logger_filter.add_custom_value(encoded_value)
+            query_params.append(f"{key}={encoded_value}")
         query_params = '&'.join(query_params)
         url = self.replace_placeholders(url, vehicle)
         return f"{url}?{query_params}"
