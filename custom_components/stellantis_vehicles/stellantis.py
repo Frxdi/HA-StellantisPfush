@@ -1,0 +1,1068 @@
+import logging
+import aiohttp
+import base64
+from PIL import Image, ImageOps
+import os
+from io import BytesIO
+from copy import deepcopy
+import paho.mqtt.client as mqtt
+import json
+from uuid import uuid4
+import asyncio
+from datetime import ( datetime, timedelta )
+import socket
+import random
+
+from homeassistant.core import ( HomeAssistant, HassJob)
+from homeassistant.helpers import translation
+from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.components import persistent_notification
+from homeassistant.helpers.event import async_track_point_in_time
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.util.ssl import client_context
+# If the Stellantis MQTT broker ever presents a certificate that fails
+# validation, import client_context_no_verify here as well and use it in
+# connect_mqtt() (see the commented line there).
+# from homeassistant.util.ssl import client_context, client_context_no_verify
+
+from .base import StellantisVehicleCoordinator
+from .otp.otp import Otp, save_otp, load_otp, ConfigException
+from .utils import ( get_datetime, rate_limit, SensitiveDataFilter, replace_string_placeholders, log_call )
+from .exceptions import ( CommunicationError, RateLimitException )
+
+from .const import (
+    DOMAIN,
+    FIELD_MOBILE_APP,
+    FIELD_COUNTRY_CODE,
+    FIELD_REMOTE_COMMANDS,
+    FIELD_NOTIFICATIONS,
+    MOBILE_APPS,
+    OAUTH_AUTHORIZE_URL,
+    OAUTH_TOKEN_URL,
+    OAUTH_CODE_URL,
+    OAUTH_AUTHORIZE_QUERY_PARAMS,
+    OAUTH_GET_TOKEN_QUERY_PARAMS,
+    OAUTH_REFRESH_TOKEN_QUERY_PARAMS,
+    OAUTH_TOKEN_HEADERS,
+    CAR_API_VEHICLES_URL,
+    CLIENT_ID_QUERY_PARAMS,
+    CAR_API_HEADERS,
+    CAR_API_GET_VEHICLE_STATUS_URL,
+    GET_OTP_URL,
+    GET_OTP_HEADERS,
+    GET_MQTT_TOKEN_URL,
+    MQTT_SERVER,
+    MQTT_PORT,
+    MQTT_KEEP_ALIVE_S,
+    MQTT_QOS,
+    MQTT_RESP_TOPIC,
+    MQTT_EVENT_TOPIC,
+    MQTT_REQ_TOPIC,
+    GET_USER_INFO_URL,
+    CAR_API_GET_VEHICLE_TRIPS_URL,
+    MQTT_REFRESH_TOKEN_JSON_DATA,
+    MQTT_REFRESH_TOKEN_TTL,
+    OTP_FILENAME,
+    ABRP_URL,
+    ABRP_API_KEY,
+    TRANSLATION_PLACEHOLDERS,
+    CAR_API_GET_VEHICLE_MAINTENANCE_URL,
+    MQTT_TOKEN_RETRY_BACKOFF
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _log_http_exchange(url, headers, response, **extra):
+    """Debug-log an HTTP request and its decoded response as a single record."""
+    if not _LOGGER.isEnabledFor(logging.DEBUG):
+        return
+    details = "".join(f" {key}={value!r}" for key, value in extra.items())
+    _LOGGER.debug(
+        "HTTP exchange | url=%s headers=%s%s | response=%s",
+        url, headers, details, response,
+    )
+
+
+# Some Stellantis MQTT servers drop packets with a TCP payload greater than 1456 bytes
+# which causes the TLS handshake to fail and later a "Connnection reset by peer" error.
+# As a workaround, we modify the MQTT client to reduce the MSS before connecting the TCP socket
+class MqttClientMod(mqtt.Client):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def _create_socket_connection(self) -> socket.socket:
+        if self._get_proxy():
+            return super()._create_socket_connection()  # SOCKS will reduce MSS by itself
+
+        addr_infos = socket.getaddrinfo(self._host, self._port, 0, socket.SOCK_STREAM)
+        addr_cnt = len(addr_infos)
+        if addr_cnt == 0:
+            raise socket.error(f"getaddrinfo returned an empty list")
+
+        # DNS returns multiple redundant MQTT IPs, but they are not rotated until the DNS cache expires
+        # we randomize the order to reconnect more quickly in case oneof them has issues and
+        # the connection fails after TCP socket open (SSL handshake, broker overloaded)
+        random.shuffle(addr_infos)
+
+        # attempt to connect, raise only if none of them are connectable
+        for af, socktype, proto, canonname, sa in addr_infos:
+            sock = None
+            try:
+                sock = socket.socket(af, socktype, proto)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, 1460 - 4)
+                sock.settimeout(self._connect_timeout)
+                sock.bind((self._bind_address, self._bind_port))
+                _LOGGER.debug("Connecting to MQTT socket: %s", sa)
+                sock.connect(sa)
+                return sock
+
+            except socket.error:
+                if sock is not None:
+                    sock.close()
+                addr_cnt -= 1
+                if addr_cnt == 0:
+                    raise
+
+
+class StellantisBase:
+    def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
+        self._config = {}
+        self._session = None
+        self.otp = None
+        self._shutting_down = False
+        self._pending_tasks: set[asyncio.Task] = set()
+
+        self.logger_filter = SensitiveDataFilter()
+        _LOGGER.addFilter(self.logger_filter)
+
+    def start_session(self):
+        if not self._session:
+            self._session = aiohttp.ClientSession()
+
+    async def close_session(self):
+        if not self._session or self._session.closed:
+            return
+        await self._session.close()
+        self._session = None
+
+    def set_mobile_app(self, mobile_app, country_code):
+        if mobile_app in MOBILE_APPS:
+            app_data = deepcopy(MOBILE_APPS[mobile_app])
+            del app_data["configs"]
+            app_data.update(MOBILE_APPS[mobile_app]["configs"][country_code])
+            self.save_config(app_data)
+            self.save_config({
+                "basic_token": base64.b64encode(bytes(self._config["client_id"] + ":" + self._config["client_secret"], 'utf-8')).decode('utf-8'),
+                "culture": country_code.lower()
+            })
+
+    def save_config(self, data):
+        for key in data:
+            self._config[key] = data[key]
+            if key == FIELD_MOBILE_APP and FIELD_COUNTRY_CODE in self._config:
+                self.set_mobile_app(data[key], self._config[FIELD_COUNTRY_CODE])
+            elif key == FIELD_COUNTRY_CODE and FIELD_MOBILE_APP in self._config:
+                self.set_mobile_app(self._config[FIELD_MOBILE_APP], data[key])
+
+    def get_config(self, key):
+        if key in self._config:
+            return self._config[key]
+        return None
+
+    @property
+    def remote_commands(self):
+        return self.get_config(FIELD_REMOTE_COMMANDS) in [None, True]
+
+    def disable_remote_commands(self):
+        self.save_config({FIELD_REMOTE_COMMANDS: False})
+        self.update_stored_config(FIELD_REMOTE_COMMANDS, False)
+
+    def replace_placeholders(self, string, vehicle=None):
+        if vehicle is None:
+            vehicle = []
+        for key in vehicle:
+            string = string.replace("{#" + key + "#}", str(vehicle[key]))
+        for key, value in self._config.items():
+            # Per-vehicle stored config is never a placeholder source and its
+            # nested dict-of-dicts shape would not stringify usefully here.
+            if key == "vehicles":
+                continue
+            if isinstance(value, dict):
+                for subkey, subvalue in value.items():
+                    string = string.replace("{#" + key + "|" + subkey + "#}", str(subvalue))
+            else:
+                string = string.replace("{#" + key + "#}", str(value))
+        return string
+
+    def apply_dict_params(self, headers):
+        new_headers = {}
+        for key in headers:
+            new_headers[key] = self.replace_placeholders(headers[key])
+        return new_headers
+
+    def apply_query_params(self, url, params, vehicle=None):
+        if vehicle is None:
+            vehicle = []
+        query_params = []
+        for key in params:
+            value = params[key]
+            query_params.append(f"{key}={value}")
+        query_params = '&'.join(query_params)
+        return self.replace_placeholders(f"{url}?{query_params}", vehicle)
+
+    @log_call
+    async def make_http_request(self, url, method='GET', headers=None, params=None, json_data=None, data=None, timeout=60, _retried=False):
+        """Perform an HTTP request and return the decoded JSON response."""
+        self.start_session()
+        try:
+            _timeout = aiohttp.ClientTimeout(total=timeout)
+            async with self._session.request(method, url, params=params, json=json_data, data=data, headers=headers, timeout=_timeout) as resp:
+                result = {}
+                if method != "DELETE" and (await resp.text()):
+                    result = await resp.json()
+
+                if not str(resp.status).startswith("20"):
+                    error = None
+                    if "httpMessage" in result and "moreInformation" in result:
+                        error = result["httpMessage"] + " - " + result["moreInformation"]
+                    elif "error" in result and "error_description" in result:
+                        error = result["error"] + " - " + result["error_description"]
+                    elif "message" in result and "code" in result:
+                        error = result["message"] + " - " + str(result["code"])
+
+                    _LOGGER.debug(
+                        "HTTP %s %s failed with status %s | headers=%s params=%s json=%s data=%s | response=%s",
+                        method, resp.url, resp.status, headers, params, json_data, data, result,
+                    )
+
+                    if str(resp.status) == "404" and str(result.get("code")) == "40400":
+                        # Not Found: We didn't find the status for this vehicle. - 40400
+                        _LOGGER.warning(error or "Vehicle status not found (HTTP 404)")
+                        return {}
+                    if str(resp.status).startswith("500") and str(result.get("code")) == "50038":
+                        # CVS error/user-vins - 50038: a transient Stellantis backend
+                        # failure while resolving the account's VIN list. Treat it like
+                        # an empty status so the coordinator keeps the last known data
+                        # for a few cycles instead of dropping every entity.
+                        _LOGGER.warning(error or "Transient CVS user-vins error (HTTP 500)")
+                        return {}
+                    if str(resp.status) == "500" and str(result.get("code")) == "50000":
+                        # Connection module replaced (https://github.com/andreadegiovine/homeassistant-stellantis-vehicles/issues/388)
+                        # https://github.com/andreadegiovine/homeassistant-stellantis-vehicles/pull/475
+                        raise CommunicationError(error or "Stellantis connection module error (HTTP 500)")
+                    if str(resp.status) == "400" and result.get("error") == "invalid_grant":
+                        # Token expiration
+                        raise ConfigEntryAuthFailed(error or "Stellantis rejected the request (invalid_grant)")
+                    if str(resp.status) == "401":
+                        # The OAuth access token was rejected. This is usually a
+                        # short-lived blip right after a token rotation, so
+                        # refresh the token once and retry the same request
+                        # before surfacing an error.
+                        if not _retried and OAUTH_TOKEN_URL not in url:
+                            _LOGGER.debug("401 received, refreshing the OAuth token and retrying once")
+                            try:
+                                await self.refresh_oauth_token_request()
+                            except (CommunicationError, RateLimitException) as refresh_err:
+                                # ConfigEntryAuthFailed (dead refresh token) is left
+                                # to propagate so Home Assistant starts reauth.
+                                _LOGGER.debug("Token refresh before retry failed: %s", refresh_err)
+                            else:
+                                new_token = (self.get_config("oauth") or {}).get("access_token")
+                                if headers and "Authorization" in headers and new_token:
+                                    headers = {**headers, "Authorization": f"Bearer {new_token}"}
+                                return await self.make_http_request(url, method, headers, params, json_data, data, timeout, _retried=True)
+                        raise CommunicationError("Stellantis rejected the access token (HTTP 401)")
+                    if str(resp.status).startswith("50"):
+                        # Internal error
+                        raise CommunicationError(error or f"Stellantis internal server error (HTTP {resp.status})")
+                    # Any other non-2xx response we don't have a specific case for
+                    raise CommunicationError(error or f"Unexpected HTTP status {resp.status}")
+
+                return result
+        except asyncio.TimeoutError as e:
+            await self.close_session()
+            _LOGGER.warning("Request to %s timed out: %s", url, e)
+            # Connection error
+            raise CommunicationError("Request timeout") from e
+        except aiohttp.client_exceptions.ClientError as e:
+            await self.close_session()
+            _LOGGER.warning("Request to %s failed: %s", url, e)
+            # Connection error
+            raise CommunicationError(e) from e
+        except (ConfigEntryAuthFailed, CommunicationError):
+            await self.close_session()
+            raise
+        except Exception:
+            await self.close_session()
+            _LOGGER.exception("Unexpected error during request to %s", url)
+            raise
+
+    def do_async(self, async_func, delay=0, wait=True):
+        if self._shutting_down:
+            # The config entry is being unloaded - drop the coroutine instead of
+            # scheduling work that would resurrect the MQTT client or hit an
+            # already closed aiohttp session.
+            async_func.close()
+            return None
+
+        async def delayed_execution():
+            task = asyncio.current_task()
+            self._pending_tasks.add(task)
+            try:
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if self._shutting_down:
+                    async_func.close()
+                    return None
+                return await async_func
+            except asyncio.CancelledError:
+                async_func.close()
+                raise
+            finally:
+                self._pending_tasks.discard(task)
+
+        future = asyncio.run_coroutine_threadsafe(delayed_execution(), self._hass.loop)
+        return future.result() if wait else None
+
+    async def hass_notify(self, translation_key):
+        """Create a persistent notification."""
+        if hasattr(self, '_entry') and not self.get_stored_config(FIELD_NOTIFICATIONS):
+            return
+
+        translations = await translation.async_get_translations(self._hass, self._hass.config.language, "common", {DOMAIN})
+        notification_title = "Stellantis Vehicles"
+        if translations.get(f"component.stellantis_vehicles.common.{translation_key}_title", None):
+            notification_title = notification_title + " - " + str(translations.get(f"component.stellantis_vehicles.common.{translation_key}_title", None))
+        notification_message = str(translations.get(f"component.stellantis_vehicles.common.{translation_key}_message", None))
+
+        notification_title = replace_string_placeholders(notification_title, TRANSLATION_PLACEHOLDERS)
+        notification_message = replace_string_placeholders(notification_message, TRANSLATION_PLACEHOLDERS)
+
+        persistent_notification.async_create(
+            self._hass,
+            notification_message,
+            title=notification_title,
+            notification_id=str(uuid4())
+        )
+
+
+class StellantisOauth(StellantisBase):
+    def get_oauth_url(self):
+        return self.apply_query_params(OAUTH_AUTHORIZE_URL, OAUTH_AUTHORIZE_QUERY_PARAMS)
+
+    @log_call
+    async def get_oauth_code(self, email, password, code_url=None, mobile_app=None, country_code=None):
+        self.logger_filter.add_custom_value(email)
+        self.logger_filter.add_custom_value(password)
+        code_url = code_url or OAUTH_CODE_URL
+        if "stelloauth" in code_url.lower():
+            # stelloauth (https://github.com/tamcore/stelloauth) exposes a different
+            # request/response format than the default worker service: it expects the
+            # brand/country instead of the authorize url, and streams its response as
+            # newline-delimited JSON (one line per event) while the headless-browser
+            # login runs, instead of a single JSON body. aiohttp's resp.json() rejects
+            # that mimetype outright, so this request is handled separately: read the
+            # raw text and parse it line by line.
+            #
+            # Each line is an *event envelope*, not the result itself:
+            #   {"type": "progress", "message": "..."}
+            #   {"type": "result", "data": {"status": "success", "data": {"code": "..."}}}
+            #   {"type": "result", "data": {"status": "error", "message": "..."}}
+            # Only the "result" event's "data" is the actual payload; "progress" events
+            # must be ignored. Using the raw last line as the payload (as before) picks
+            # up the *event envelope* itself, whose own top-level "code" field is just
+            # the fixed status label "OAUTH_CODE" - not the real authorization code -
+            # which made every automatic login send "OAUTH_CODE" to Stellantis instead
+            # of the actual code, reliably causing "invalid_grant".
+            self.start_session()
+            oauth_code_request = {}
+            try:
+                _timeout = aiohttp.ClientTimeout(total=300)
+                async with self._session.request(
+                    'POST',
+                    code_url.rstrip("/") + "/oauth",
+                    json={"brand": mobile_app, "country": country_code, "email": email, "password": password},
+                    timeout=_timeout
+                ) as resp:
+                    raw_text = await resp.text()
+                    for line in raw_text.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            parsed_line = json.loads(line)
+                        except ValueError:
+                            continue
+                        if isinstance(parsed_line, dict) and parsed_line.get("type") == "result" and isinstance(parsed_line.get("data"), dict):
+                            oauth_code_request = parsed_line["data"]
+                    if not str(resp.status).startswith("20"):
+                        error = oauth_code_request.get("error") or oauth_code_request.get("message") or raw_text
+                        _LOGGER.debug("POST request error %s: %s", str(resp.status), resp.url)
+                        _LOGGER.debug(oauth_code_request)
+                        raise Exception(error)
+            except asyncio.TimeoutError as e:
+                await self.close_session()
+                _LOGGER.warning(f"Error: {e}")
+                raise CommunicationError("Request timeout")
+            except aiohttp.client_exceptions.ClientError as e:
+                await self.close_session()
+                _LOGGER.warning(f"Error: {e}")
+                raise CommunicationError(e)
+            if "data" in oauth_code_request and "code" in oauth_code_request["data"]:
+                oauth_code_request["code"] = oauth_code_request["data"]["code"]
+            elif oauth_code_request.get("status") != "success" or "code" not in oauth_code_request:
+                # The stream ended without a usable "result" event (e.g. a login/consent
+                # failure), so surface the actual message instead of silently continuing
+                # with a missing/incorrect code.
+                raise Exception(oauth_code_request.get("message") or "stelloauth did not return an OAuth code")
+        else:
+            oauth_code_request = await self.make_http_request(code_url, 'POST', None, None, {"url": self.get_oauth_url(), "email": email, "password": password}, None, 300)
+        if "code" in oauth_code_request:
+            self.logger_filter.add_custom_value(oauth_code_request["code"])
+        _LOGGER.debug("OAuth code response: %s", oauth_code_request)
+        return oauth_code_request
+
+    @log_call
+    async def get_access_token(self):
+        url = self.apply_query_params(OAUTH_TOKEN_URL, OAUTH_GET_TOKEN_QUERY_PARAMS)
+        headers = self.apply_dict_params(OAUTH_TOKEN_HEADERS)
+        token_request = await self.make_http_request(url, 'POST', headers)
+        if "access_token" in token_request:
+            self.logger_filter.add_custom_value(token_request["access_token"])
+        if "refresh_token" in token_request:
+            self.logger_filter.add_custom_value(token_request["refresh_token"])
+        if "id_token" in token_request:
+            self.logger_filter.add_custom_value(token_request["id_token"])
+        _log_http_exchange(url, headers, token_request)
+        return token_request
+
+    @log_call
+    async def get_user_info(self):
+        url = self.apply_query_params(GET_USER_INFO_URL, CLIENT_ID_QUERY_PARAMS)
+        headers = self.apply_dict_params(GET_OTP_HEADERS)
+        headers["x-transaction-id"] = "1234"
+        user_request = await self.make_http_request(url, 'GET', headers)
+        user_info = user_request[0] if isinstance(user_request, list) and user_request else {}
+        for key in ("customer", "vehicle", "car_association_id"):
+            if key in user_info:
+                self.logger_filter.add_custom_value(user_info[key])
+        _log_http_exchange(url, headers, user_request)
+        # Always hand back a list so callers can safely index [0]; a non-list
+        # body (error object, changed shape) becomes an empty list, which the
+        # config flow reports as missing user info.
+        return user_request if isinstance(user_request, list) else []
+
+    def new_otp(self, sms_code, pin_code):
+        try:
+            self.otp = Otp("bb8e981582b0f31353108fb020bead1c", device_id=str(self.get_config("oauth")["access_token"][:16]))
+            self.otp.smsCode = sms_code
+            self.otp.codepin = pin_code
+            if self.otp.activation_start():
+                finalyze = self.otp.activation_finalyze()
+                if finalyze != 0:
+                    raise ConfigException(finalyze)
+        except ConfigException as e:
+            _LOGGER.error(str(e))
+            raise
+        except Exception as e:
+            _LOGGER.error(str(e))
+            raise ConfigException(str(e)) from e
+
+    @log_call
+    async def get_otp_sms(self):
+        url = self.apply_query_params(GET_OTP_URL, CLIENT_ID_QUERY_PARAMS)
+        headers = self.apply_dict_params(GET_OTP_HEADERS)
+        sms_request = await self.make_http_request(url, 'POST', headers)
+        _log_http_exchange(url, headers, sms_request)
+        return sms_request
+
+    @log_call
+    async def get_mqtt_access_token(self):
+        url = self.apply_query_params(GET_MQTT_TOKEN_URL, CLIENT_ID_QUERY_PARAMS)
+        headers = self.apply_dict_params(GET_OTP_HEADERS)
+        try:
+            otp_code = await self.get_otp_code()
+            token_request = await self.make_http_request(url, 'POST', headers, None, {"grant_type": "password", "password": otp_code})
+            if "access_token" in token_request:
+                self.logger_filter.add_custom_value(token_request["access_token"])
+            if "refresh_token" in token_request:
+                self.logger_filter.add_custom_value(token_request["refresh_token"])
+            _log_http_exchange(url, headers, token_request)
+        except ConfigException as e:
+            raise ConfigEntryAuthFailed(str(e)) from e
+        return token_request
+
+    @log_call
+    @rate_limit(6, 86400) # 6 per 1 day
+    async def get_otp_code(self):
+        # Check if storage path exists, if not create it
+        hass_config_path = self._hass.config.path()
+        storage_path = os.path.join(hass_config_path, ".storage", DOMAIN)
+        if not os.path.isdir(storage_path):
+            os.mkdir(storage_path)
+        # Generate OTP file path from customer_id
+        otp_file_path = os.path.join(storage_path, OTP_FILENAME)
+        otp_file_path = otp_file_path.replace("{#customer_id#}", self.get_config("customer_id"))
+        # Check if OTP object is already loaded, if not load it
+        if self.otp is None:
+            if not os.path.isfile(otp_file_path):
+                _LOGGER.error("OTP file '%s' not found, please reauthenticate", otp_file_path)
+                raise ConfigEntryAuthFailed("OTP file not found, please reauthenticate")
+            self.otp = await self._hass.async_add_executor_job(load_otp, otp_file_path)
+        # Get the OTP code using OTP object. It seems there is a rate limit of 6 requests per 24h
+        otp_code = await self._hass.async_add_executor_job(self.otp.get_otp_code)
+        if otp_code is None:
+            _LOGGER.error("OTP code is empty, please reauthenticate")
+            raise ConfigEntryAuthFailed("OTP code is empty, please reauthenticate")
+        # Save updated OTP object to file
+        await self._hass.async_add_executor_job(save_otp, self.otp, otp_file_path)
+        return otp_code
+
+
+class StellantisVehicles(StellantisOauth):
+    def __init__(self, hass: HomeAssistant) -> None:
+        super().__init__(hass)
+
+        self._entry = None
+        self._coordinator_dict = {}
+        self._vehicles = []
+        self._mqtt = None
+        self._mqtt_last_request = None
+
+        self._oauth_token_scheduled = None
+        self._mqtt_token_scheduled = None
+        self._mqtt_token_retry = 0
+
+    def set_entry(self, entry):
+        self._entry = entry
+        self.logger_filter.add_entry_values(self._config)
+
+    def update_stored_config(self, config, value):
+        data = self._entry.data
+        new_data = {}
+        for key in data:
+            new_data[key] = deepcopy(data[key])
+        if config not in new_data:
+            new_data[config] = None
+        new_data[config] = value
+        self._hass.config_entries.async_update_entry(self._entry, data=new_data)
+
+    def get_stored_config(self, config):
+        if config in self._entry.data:
+            return self._entry.data[config]
+        return None
+
+    def get_vehicles_stored_config(self):
+        """Return the per-vehicle stored config sub-node, keyed by VIN."""
+        return self.get_stored_config("vehicles") or {}
+
+    def update_vehicle_stored_config(self, vin, key, value):
+        vehicles = deepcopy(self.get_vehicles_stored_config())
+        vehicles.setdefault(vin, {})[key] = value
+        self.update_stored_config("vehicles", vehicles)
+        self._config["vehicles"] = deepcopy(vehicles)
+
+    def get_vehicle_stored_config(self, vin, key):
+        vehicle = self.get_vehicles_stored_config().get(vin)
+        if vehicle and key in vehicle:
+            return vehicle[key]
+        return None
+
+    def prune_stored_vehicle_configs(self, live_vins):
+        """Drop per-vehicle stored config for vehicles no longer on the account."""
+        vehicles = self.get_vehicles_stored_config()
+        stale = [vin for vin in vehicles if vin not in live_vins]
+        if not stale:
+            return []
+        new_vehicles = {vin: deepcopy(value) for vin, value in vehicles.items() if vin not in stale}
+        self.update_stored_config("vehicles", new_vehicles)
+        self._config["vehicles"] = deepcopy(new_vehicles)
+        _LOGGER.info("Removed stored config for vehicles no longer on the account: %s", ", ".join(stale))
+        return stale
+
+    def async_get_coordinator_by_vin(self, vin):
+        if vin in self._coordinator_dict:
+            return self._coordinator_dict[vin]
+        return None
+
+    def async_get_coordinator_by_action_id(self, action_id):
+        for vin in self._coordinator_dict:
+            if action_id in self._coordinator_dict[vin]._commands_history:
+                return self._coordinator_dict[vin]
+        return None
+
+    async def async_get_coordinator(self, vehicle):
+        vin = vehicle["vin"]
+        if vin in self._coordinator_dict:
+            return self._coordinator_dict[vin]
+        translations = await translation.async_get_translations(self._hass, self._hass.config.language, "entity", {DOMAIN})
+        coordinator = StellantisVehicleCoordinator(self._hass, self._config, vehicle, self, translations, config_entry=self._entry)
+        self._coordinator_dict[vin] = coordinator
+        return coordinator
+
+    async def resize_and_save_picture(self, url, vin):
+        public_path = self._hass.config.path("www")
+        customer_id = self.get_config("customer_id")
+        if not os.path.isdir(public_path):
+            _LOGGER.warning("Folder \"www\" not found in configuration folder")
+            return url
+        entry_path = f"{public_path}/{DOMAIN}/{customer_id}"
+        if not os.path.isdir(entry_path):
+            os.makedirs(entry_path, exist_ok=True)
+        image_path = f"{entry_path}/{vin}.png"
+        image_url = image_path.replace(public_path, "/local")
+        if os.path.isfile(image_path):
+            return image_url
+        session = async_get_clientsession(self._hass)
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            resp.raise_for_status()
+            image_data = await resp.read()
+
+        def _resize_and_save() -> None:
+            with Image.open(BytesIO(image_data)) as im:
+                im = ImageOps.pad(im, (400, 400))
+                im.save(image_path)
+
+        await self._hass.async_add_executor_job(_resize_and_save)
+        return image_url
+
+    def reset_scheduled_tokens(self):
+        self.reset_scheduled_oauth_token()
+        self.reset_scheduled_mqtt_token()
+
+    def reset_scheduled_oauth_token(self):
+        if self._oauth_token_scheduled is not None:
+            self._oauth_token_scheduled()
+            self._oauth_token_scheduled = None
+
+    def reset_scheduled_mqtt_token(self):
+        if self._mqtt_token_scheduled is not None:
+            self._mqtt_token_scheduled()
+            self._mqtt_token_scheduled = None
+
+    async def async_shutdown(self) -> None:
+        """Tear down everything created for this config entry.
+
+        Called from async_unload_entry so a reload does not leak the paho-mqtt
+        network thread, the delayed do_async reconnect tasks, the scheduled
+        token-refresh callbacks or the aiohttp session.
+        """
+        self._shutting_down = True
+
+        # Stop the scheduled oauth/mqtt token-refresh callbacks.
+        self.reset_scheduled_tokens()
+
+        # Cancel any pending (possibly still sleeping) do_async coroutines,
+        # e.g. the 300s MQTT reconnect scheduled from _on_mqtt_subscribe.
+        for task in list(self._pending_tasks):
+            task.cancel()
+        self._pending_tasks.clear()
+
+        # Tear down the MQTT client and join its network thread.
+        if self._mqtt is not None:
+            mqtt_client, self._mqtt = self._mqtt, None
+            # Drop the reconnect / token-refresh callback so the deliberate
+            # disconnect below does not trigger a fresh reconnect attempt.
+            mqtt_client.on_disconnect = None
+            mqtt_client.disconnect()
+            await self._hass.async_add_executor_job(mqtt_client.loop_stop)
+
+        # Close the shared aiohttp session.
+        await self.close_session()
+
+    async def scheduled_tokens_refresh(self):
+        self.reset_scheduled_tokens()
+        await self.scheduled_oauth_token_refresh()
+        await self.scheduled_mqtt_token_refresh()
+
+    @log_call
+    async def scheduled_oauth_token_refresh(self, now=None):
+        def get_next_run():
+            expires_in = self.get_config("oauth")["expires_in"]
+            return datetime.fromisoformat(expires_in) - timedelta(minutes=5)
+        try:
+            if self._oauth_token_scheduled is not None:
+                self.reset_scheduled_oauth_token()
+                await self.refresh_oauth_token_request()
+            elif get_datetime() > get_next_run():
+                await self.refresh_oauth_token_request()
+            next_run = get_next_run()
+        except CommunicationError:
+            next_run = get_datetime() + timedelta(minutes=5)
+        except RateLimitException:
+            _LOGGER.warning("Rate limit exceeded, retry after 30 mins or check logs and restart integration")
+            next_run = get_datetime() + timedelta(minutes=30)
+        _LOGGER.debug("Next oauth token refresh scheduled for %s", next_run)
+        next_job = HassJob(self.scheduled_oauth_token_refresh, f"{DOMAIN} refresh oauth token: {next_run}", cancel_on_shutdown=True)
+        self._oauth_token_scheduled = async_track_point_in_time(self._hass, next_job, next_run)
+
+    @log_call
+    @rate_limit(6, 1800) # 6 per 30 min
+    async def refresh_oauth_token_request(self):
+        url = self.apply_query_params(OAUTH_TOKEN_URL, OAUTH_REFRESH_TOKEN_QUERY_PARAMS)
+        headers = self.apply_dict_params(OAUTH_TOKEN_HEADERS)
+        token_request = await self.make_http_request(url, 'POST', headers)
+        self.logger_filter.add_custom_value(token_request["access_token"])
+        self.logger_filter.add_custom_value(token_request["refresh_token"])
+        _log_http_exchange(url, headers, token_request)
+        new_config = {
+            "access_token": token_request["access_token"],
+            "refresh_token": token_request["refresh_token"],
+            "expires_in": (get_datetime() + timedelta(seconds=int(token_request["expires_in"]))).isoformat()
+        }
+        self.save_config({"oauth": new_config})
+        self.update_stored_config("oauth", new_config)
+
+    @log_call
+    async def get_user_vehicles(self, force=False):
+        if force:
+            # Drop the cache so the account vehicle list is fetched again, e.g. to
+            # confirm a vehicle was unpaired without restarting Home Assistant.
+            self._vehicles = []
+        if not self._vehicles:
+            url = self.apply_query_params(CAR_API_VEHICLES_URL, CLIENT_ID_QUERY_PARAMS)
+            headers = self.apply_dict_params(CAR_API_HEADERS)
+            vehicles_request = await self.make_http_request(url, 'GET', headers)
+            if not isinstance(vehicles_request, dict) or not vehicles_request:
+                # An empty or non-object body on a 2xx response is not a valid
+                # vehicle list. Treat it as a transient API problem instead of
+                # reporting the account as having no vehicles.
+                raise CommunicationError("Empty or invalid response from the vehicles endpoint")
+            if "_embedded" in vehicles_request:
+                if "vehicles" in vehicles_request["_embedded"]:
+                    for vehicle in vehicles_request["_embedded"]["vehicles"]:
+                        self.logger_filter.add_custom_value(vehicle["vin"])
+                        self.logger_filter.add_custom_value(vehicle["id"])
+            _log_http_exchange(url, headers, vehicles_request)
+            if "_embedded" in vehicles_request:
+                if "vehicles" in vehicles_request["_embedded"]:
+                    for vehicle in vehicles_request["_embedded"]["vehicles"]:
+                        vehicle_data = {
+                            "vehicle_id": vehicle["id"],
+                            "vin": vehicle["vin"],
+                            "type": vehicle["motorization"],
+                            "brand": vehicle.get("brand")
+                        }
+                        try:
+                            picture = await self.resize_and_save_picture(vehicle["pictures"][0], vehicle["vin"])
+                            vehicle_data["picture"] = picture
+                        except Exception as e:
+                            pictures = vehicle.get("pictures") or []
+                            _LOGGER.warning(
+                                "Unable to download and save the vehicle picture for VIN %s from %s: %s",
+                                vehicle["vin"],
+                                pictures[0] if pictures else "<no picture URL>",
+                                e,
+                            )
+                        self._vehicles.append(vehicle_data)
+                else:
+                    _LOGGER.warning("No vehicles found in vehicles_request['_embedded']")
+            else:
+                _LOGGER.warning("No _embedded found in vehicles_request")
+        return self._vehicles
+
+    @log_call
+    async def get_vehicle_status(self, vehicle):
+        # Ensure that the MQTT client is connected
+        if self.remote_commands and (self._mqtt is None or self._mqtt.is_connected() is False):
+            _LOGGER.debug("MQTT client is not connected, try to connect it")
+            await self.connect_mqtt()
+        # Fetch the vehicle status using the API
+        url = self.apply_query_params(CAR_API_GET_VEHICLE_STATUS_URL, CLIENT_ID_QUERY_PARAMS, vehicle)
+        headers = self.apply_dict_params(CAR_API_HEADERS)
+        vehicle_status_request = await self.make_http_request(url, 'GET', headers)
+        _log_http_exchange(url, headers, vehicle_status_request)
+        return vehicle_status_request
+
+    @log_call
+    async def get_vehicle_last_trip(self, vehicle, page_token=None):
+        url = self.apply_query_params(CAR_API_GET_VEHICLE_TRIPS_URL, CLIENT_ID_QUERY_PARAMS, vehicle)
+        headers = self.apply_dict_params(CAR_API_HEADERS)
+        limit_date = (get_datetime() - timedelta(days=1)).isoformat(timespec="seconds")
+        url += "&timestamps=" + limit_date + "/" + "&distance=0.1-" #+ "&pageSize=60"
+        if page_token is not None:
+            url += "&pageToken=" + page_token
+        vehicle_trips_request = await self.make_http_request(url, 'GET', headers)
+        _log_http_exchange(url, headers, vehicle_trips_request)
+        links = vehicle_trips_request.get("_links", {})
+        last_href = links.get("last", {}).get("href")
+        self_href = links.get("self", {}).get("href")
+        if last_href and last_href != self_href:
+            next_page_token = last_href.split("pageToken=")[-1]
+            if next_page_token != page_token:
+                return await self.get_vehicle_last_trip(vehicle, next_page_token)
+        return vehicle_trips_request
+
+    @log_call
+    async def get_vehicle_maintenance(self, vehicle):
+        """ Fetch upcoming maintenance data (mileage/days remaining) for the vehicle. """
+        url = self.apply_query_params(CAR_API_GET_VEHICLE_MAINTENANCE_URL, CLIENT_ID_QUERY_PARAMS, vehicle)
+        headers = self.apply_dict_params(CAR_API_HEADERS)
+        vehicle_maintenance_request = await self.make_http_request(url, 'GET', headers)
+        _log_http_exchange(url, headers, vehicle_maintenance_request)
+        return vehicle_maintenance_request
+
+#     async def get_vehicle_trips(self, page_token=False):
+#         _LOGGER.debug("---------- START get_vehicle_trips")
+#         url = self.apply_query_params(CAR_API_GET_VEHICLE_TRIPS_URL, CLIENT_ID_QUERY_PARAMS)
+#         headers = self.apply_dict_params(CAR_API_HEADERS)
+#         url = url + "&distance=0.1-"
+#         if page_token:
+#             url = url + "&pageToken=" + page_token
+#         vehicle_trips_request = await self.make_http_request(url, 'GET', headers)
+#         _LOGGER.debug(url)
+#         _LOGGER.debug(headers)
+#         _LOGGER.debug(vehicle_trips_request)
+#         _LOGGER.debug("---------- END get_vehicle_trips")
+#         return vehicle_trips_request
+
+    @log_call
+    async def scheduled_mqtt_token_refresh(self, now=None, force=False):
+        if not self.remote_commands:
+            return
+        def get_next_run():
+            mqtt_config = self.get_config("mqtt")
+            expires_in = mqtt_config["expires_in"]
+            return datetime.fromisoformat(expires_in) - timedelta(minutes=3)
+        try:
+            self.reset_scheduled_mqtt_token()
+            if force or get_datetime() > get_next_run():
+                await self.refresh_mqtt_token_request()
+            self._mqtt_token_retry = 0
+            next_run = get_next_run()
+        except CommunicationError as err:
+            self._mqtt_token_retry += 1
+            idx = min(self._mqtt_token_retry - 1, len(MQTT_TOKEN_RETRY_BACKOFF) - 1)
+            delay = MQTT_TOKEN_RETRY_BACKOFF[idx]
+            delay += random.uniform(0, delay * 0.1)
+            next_run = get_datetime() + timedelta(seconds=delay)
+            _LOGGER.warning(
+                "MQTT token refresh failed (attempt %s), next retry at %s: %s",
+                self._mqtt_token_retry, next_run, err,
+            )
+        except RateLimitException:
+            self._mqtt_token_retry = 0
+            _LOGGER.warning("Rate limit exceeded, retry after 1 day or check logs and restart integration")
+            next_run = get_datetime() + timedelta(days=1)
+        except ConfigException:
+            self._mqtt_token_retry = 0
+            self.disable_remote_commands()
+            await self.hass_notify("reconfigure_otp")
+            _LOGGER.error("MQTT authentication error. To enable remote commands again please reconfigure the integration")
+            return
+        _LOGGER.debug("Next mqtt token refresh scheduled for %s", next_run)
+        next_job = HassJob(self.scheduled_mqtt_token_refresh, f"{DOMAIN} refresh mqtt token: {next_run}", cancel_on_shutdown=True)
+        self._mqtt_token_scheduled = async_track_point_in_time(self._hass, next_job, next_run)
+
+    @log_call
+    async def refresh_mqtt_token_request(self, access_token_only=False):
+        url = self.apply_query_params(GET_MQTT_TOKEN_URL, CLIENT_ID_QUERY_PARAMS)
+        headers = self.apply_dict_params(GET_OTP_HEADERS)
+        mqtt_config = self.get_config("mqtt")
+        refresh_token_almost_expired = "refresh_token_expires_at" not in mqtt_config or datetime.fromisoformat(mqtt_config["refresh_token_expires_at"]) < get_datetime()
+        if refresh_token_almost_expired and not access_token_only:
+            otp_code = await self.get_otp_code()
+            try:
+                token_request = await self.make_http_request(url, 'POST', headers, None, {"grant_type": "password", "password": otp_code})
+            except ConfigEntryAuthFailed:
+                _LOGGER.warning("Attempt to refresh MQTT access_token/refresh_token failed. This is NOT an error as long as the following attempt to refresh only the access_token (using current refresh_token) succeeds.")
+                return await self.refresh_mqtt_token_request(True)
+        else:
+            json_data = self.apply_dict_params(MQTT_REFRESH_TOKEN_JSON_DATA)
+            token_request = await self.make_http_request(url, 'POST', headers, None, json_data)
+        if "access_token" in token_request:
+            self.logger_filter.add_custom_value(token_request["access_token"])
+        if "refresh_token" in token_request:
+            self.logger_filter.add_custom_value(token_request["refresh_token"])
+        _log_http_exchange(url, headers, token_request)
+        if not "access_token" in token_request:
+            _LOGGER.warning("Refreshing mqtt access_token failed (no access_token in response)")
+            return None
+        mqtt_config["access_token"] = token_request["access_token"]
+        mqtt_config["expires_in"] = (get_datetime() + timedelta(seconds=int(token_request["expires_in"]))).isoformat()
+        if "refresh_token" in token_request:
+            mqtt_config["refresh_token"] = token_request["refresh_token"]
+            mqtt_config["refresh_token_expires_at"] = (get_datetime() + timedelta(minutes=int(MQTT_REFRESH_TOKEN_TTL))).isoformat()
+        self.save_config({"mqtt": mqtt_config})
+        self.update_stored_config("mqtt", mqtt_config)
+
+    @log_call
+    async def connect_mqtt(self):
+        if self._shutting_down:
+            # A coordinator refresh still in flight during unload must not
+            # recreate the MQTT client async_shutdown just tore down.
+            return False
+        if self._mqtt is None:
+            self._mqtt = MqttClientMod(clean_session=True, protocol=mqtt.MQTTv311)
+            # self._mqtt.enable_logger(logger=_LOGGER)
+            # Reuse Home Assistant's shared, pre-built client SSL context instead
+            # of building one here (which did blocking cert loading at import).
+            self._mqtt.tls_set_context(client_context())
+            # If the broker's certificate fails validation, swap the line above
+            # for the unverified context (and adjust the import at the top):
+            # self._mqtt.tls_set_context(client_context_no_verify())
+            self._mqtt.on_connect = self._on_mqtt_connect
+            self._mqtt.on_disconnect = self._on_mqtt_disconnect
+            self._mqtt.on_message = self._on_mqtt_message
+            self._mqtt.on_subscribe = self._on_mqtt_subscribe
+        if self._mqtt.is_connected():
+            self._mqtt.disconnect()
+        self._mqtt.username_pw_set("IMA_OAUTH_ACCESS_TOKEN", self.get_config("mqtt")["access_token"])
+        try:
+            # paho's connect() does blocking DNS + TCP + TLS handshake, so run it in the executor to keep the event loop responsive.
+            await self._hass.async_add_executor_job(
+                self._mqtt.connect, MQTT_SERVER, MQTT_PORT, MQTT_KEEP_ALIVE_S
+            )
+            self._mqtt.loop_start() # Under the hood, this will call loop_forever in a thread, which means that the thread will terminate if we call disconnect()
+        except Exception as e:
+            _LOGGER.warning("Failed to connect to the MQTT broker: %s", e)
+        return self._mqtt.is_connected()
+
+    @log_call
+    def _on_mqtt_connect(self, client, userdata, result_code, _):
+        _LOGGER.debug("MQTT connected (code %s)", result_code)
+        try:
+            topics = [MQTT_RESP_TOPIC + self.get_config("customer_id") + "/#"]
+            for vehicle in self._vehicles:
+                topics.append(MQTT_EVENT_TOPIC + vehicle["vin"])
+            for topic in topics:
+                client.subscribe(topic, qos=MQTT_QOS)
+                _LOGGER.debug("Subscribed to MQTT topic %s", topic)
+        except Exception:
+            _LOGGER.exception("Error while subscribing to MQTT topics")
+
+    @log_call
+    def _on_mqtt_disconnect(self, client, userdata, result_code):
+        _LOGGER.debug("MQTT disconnected (code %s: %s)", result_code, mqtt.error_string(result_code))
+        if result_code == 11: # MQTT_ERR_AUTH
+            # Runs on the paho network thread; wait=False keeps the reconnect loop
+            # from blocking on the token refresh (network I/O, no timeout).
+            # do_async already guards shutdown and the coroutine logs its own errors.
+            self.do_async(self.scheduled_mqtt_token_refresh(force=True), wait=False)
+
+    @log_call
+    def _on_mqtt_subscribe(self, client, userdata, mid, granted_qos):
+        try:
+            if any(qos == 0x80 for qos in granted_qos):
+                _LOGGER.warning("Subscription failed, will try to reconnect MQTT in 300 seconds")
+                # wait=False: this callback runs on the paho-mqtt network thread, so
+                # blocking it for 300s here would stall the loop (pings, reconnects,
+                # other callbacks)
+                self.do_async(self.connect_mqtt(), 300, wait=False)
+            else:
+                _LOGGER.debug("MQTT subscription completed (QoS: %s)", granted_qos)
+        except Exception:
+            _LOGGER.exception("Error in MQTT subscribe callback")
+
+    @log_call
+    def _on_mqtt_message(self, client, userdata, msg):
+        try:
+            _LOGGER.debug("MQTT message on %s (qos %s): %s", msg.topic, msg.qos, msg.payload)
+            data = json.loads(msg.payload)
+            if msg.topic.startswith(MQTT_RESP_TOPIC):
+                if "vin" in data:
+                    coordinator = self.async_get_coordinator_by_vin(data["vin"])
+                else:
+                    coordinator = self.async_get_coordinator_by_action_id(data["correlation_id"])
+
+                if not coordinator:
+                    _LOGGER.error("No coordinator found by vin or correlation_id")
+                    return
+
+                result_code = None
+                if "return_code" in data:
+                    result_code = data["return_code"]
+                elif "process_code" in data:
+                    result_code = data["process_code"]
+
+                if result_code:
+                    if result_code == "400":
+                        if "reason" in data and data["reason"] == "[authorization.denied.cvs.response.no.matching.service.key]":
+                            result_code = "not_compatible"
+                        elif self._mqtt_last_request:
+                            _LOGGER.debug("The mqtt token seems invalid, refresh the token and try sending the request again")
+                            last_request = self._mqtt_last_request
+                            self._mqtt_last_request = None
+                            # wait=False: don't block the paho network thread while the
+                            # retry forces a token refresh; the result comes back as a
+                            # fresh MQTT response and send_mqtt_message logs its own errors
+                            self.do_async(self.send_mqtt_message(last_request[0], last_request[1], coordinator._vehicle, False, data["correlation_id"]), wait=False)
+                            return
+                        else:
+                            _LOGGER.warning("Last request was sent twice without success")
+                            result_code = "failed"
+                    if result_code == "113":  # Error: vin (https://github.com/andreadegiovine/homeassistant-stellantis-vehicles/issues/388)
+                        result_code = "failed"
+                    # wait=False: fire-and-forget so the paho network thread isn't
+                    # blocked (the results aren't used here anyway)
+                    if result_code in ["300", "500", "not_compatible", "failed"]:
+                        self.do_async(self.hass_notify("command_error"), wait=False)
+                    if result_code == "0":
+                        _LOGGER.debug("Fetching updates after result code %s", result_code)
+                        self.do_async(coordinator.async_refresh(), 10, wait=False)
+                    if result_code == "901":
+                        _LOGGER.debug("Skip vehicle as sleep mqtt message")
+                        return
+
+                    self.do_async(coordinator.update_command_history(data["correlation_id"], result_code), wait=False)
+                else:
+                    _LOGGER.error("No result code")
+
+            elif msg.topic.startswith(MQTT_EVENT_TOPIC):
+#                 charge_info = data["charging_state"]
+#                 programs = data["precond_state"].get("programs", None)
+#                 if programs:
+#                     self.precond_programs[data["vin"]] = data["precond_state"]["programs"]
+                _LOGGER.debug("Update data from mqtt?!?")
+        except Exception:
+            _LOGGER.exception("Error while handling MQTT message")
+
+    @log_call
+    async def send_mqtt_message(self, service, message, vehicle, store=True, action_id=None):
+        # we need to refresh the token if it is expired, either here upfront or in the mqtt callback '_on_mqtt_message' in case of result_code 400
+        try:
+            await self.scheduled_mqtt_token_refresh(force=(store == False))
+            customer_id = self.get_config("customer_id")
+            topic = MQTT_REQ_TOPIC + customer_id + service
+            date = get_datetime()
+            if action_id is None:
+                action_id = str(uuid4()).replace("-", "") + date.strftime("%Y%m%d%H%M%S%f")[:-3]
+            data = json.dumps({
+                "access_token": self.get_config("mqtt")["access_token"],
+                "customer_id": customer_id,
+                "correlation_id": action_id,
+                "req_date": date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "vin": vehicle["vin"],
+                "req_parameters": message
+            })
+            _LOGGER.debug("Publishing MQTT message to %s: %s", topic, data)
+            message_info = self._mqtt.publish(topic, data, qos=MQTT_QOS, retain=False)
+            if message_info.rc != mqtt.MQTT_ERR_SUCCESS:
+                _LOGGER.warning("Failed to send MQTT message: %s", mqtt.error_string(message_info.rc))
+                action_id = None
+            if store:
+                self._mqtt_last_request = [service, message]
+            return action_id
+        except ConfigEntryAuthFailed:
+            self.disable_remote_commands()
+            await self.hass_notify("reconfigure_otp")
+            _LOGGER.error("MQTT authentication error. To enable remote commands again please reconfigure the integration")
+            # Re-raise so the caller can trigger Home Assistant's reauth flow.
+            raise
+        except Exception:
+            _LOGGER.exception("Unexpected error during MQTT message sending")
+            raise
+
+    @log_call
+    async def send_abrp_data(self, params):
+        params["api_key"] = ABRP_API_KEY
+        _LOGGER.debug("ABRP request params: %s", params)
+        try:
+            abrp_request = await self.make_http_request(ABRP_URL, "POST", None, params)
+            _LOGGER.debug("ABRP response: %s", abrp_request)
+            if "status" not in abrp_request or abrp_request["status"] != "ok":
+                _LOGGER.warning("Unexpected ABRP response: %s", abrp_request)
+        except Exception as e:
+            _LOGGER.warning("Failed to send ABRP data: %s", e)

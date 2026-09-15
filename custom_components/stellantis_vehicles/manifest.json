@@ -1,0 +1,22 @@
+{
+  "domain": "PfushStellantis Vehicles",
+  "name": "PfushStellantis Vehicles",
+  "codeowners": [
+    "@Frxdi"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "frontend",
+    "http",
+    "webhook"
+  ],
+  "documentation": "https://github.com/Frxdi/HA-StellantisPfush",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/Frxdi/HA-StellantisPfush/issues",
+  "requirements": [
+    "Pillow==12.*",
+    "pycryptodome==3.*",
+    "paho-mqtt>=1.3"
+  ],
+  "version": "2030.9.2"
+}
