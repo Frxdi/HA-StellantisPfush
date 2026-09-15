@@ -1,0 +1,37 @@
+import logging
+
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import EntityDescription
+
+from .base import StellantisBaseDevice
+
+from .const import (
+    SENSORS_DEFAULT
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+# Read-only platform, all state is provided by the coordinator.
+PARALLEL_UPDATES = 0
+
+async def async_setup_entry(hass:HomeAssistant, entry, async_add_entities) -> None:
+    stellantis = entry.runtime_data
+    entities = []
+
+    vehicles = await stellantis.get_user_vehicles()
+
+    for vehicle in vehicles:
+        coordinator = await stellantis.async_get_coordinator(vehicle)
+        default_value = SENSORS_DEFAULT.get("vehicle", {})
+        description = EntityDescription(
+            name = "vehicle",
+            key = "vehicle",
+            translation_key = "vehicle",
+            icon = default_value.get("icon", None),
+            entity_category = None
+        )
+        entities.extend([StellantisBaseDevice(coordinator, description)])
+
+#         await coordinator.async_request_refresh()
+
+    async_add_entities(entities)
