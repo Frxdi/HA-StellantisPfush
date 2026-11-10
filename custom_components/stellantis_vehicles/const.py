@@ -135,6 +135,7 @@ EMPTY_STATUS_LIMIT = 3
 # cap, every sent command would stay in memory (and be re-sorted on every
 # coordinator update) for as long as the coordinator lives.
 COMMAND_HISTORY_LIMIT = 50
+PENDING_ACTION_TIMEOUT = 600 # seconds without vehicle answer before commands unlock again
 
 # Backoff schedule (seconds) for the MQTT token refresh after a transient
 # Stellantis backend failure. Capped at the last step so a prolonged outage is
