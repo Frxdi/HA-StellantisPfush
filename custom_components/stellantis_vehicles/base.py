@@ -29,7 +29,8 @@ from .const import (
     UPDATE_INTERVAL,
     EMPTY_STATUS_LIMIT,
     COMMAND_HISTORY_LIMIT,
-    KWH_CORRECTION
+    KWH_CORRECTION,
+    PENDING_ACTION_TIMEOUT
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -222,8 +223,16 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         """ Pending action. """
         if not self._commands_history:
             return False
-        last_action_id = list(self._commands_history.keys())[-1]
-        return not self._commands_history[last_action_id]["updates"]
+        ast_action_id = list(self._commands_history.keys())[-1]
+        last_action = self._commands_history[last_action_id]
+        if last_action["updates"]:
+            return False
+        # No answer from the vehicle yet. Do not block every command forever
+        # if the answer never arrives (sleeping car, lost MQTT message).
+        sent_at = last_action.get("date")
+        if sent_at is not None and get_datetime() - sent_at > timedelta(seconds=PENDING_ACTION_TIMEOUT):
+            return False
+        return True
 
     def _prune_command_history(self):
         """ Drop the oldest command-history entries beyond COMMAND_HISTORY_LIMIT.
@@ -260,7 +269,7 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         try:
             action_id = await self._stellantis.send_mqtt_message(service, message, self._vehicle)
             if action_id is not None:
-                self._commands_history.update({action_id: {"name": name, "updates": []}})
+                self._commands_history.update({action_id: {"name": name, "updates": [], "date": get_datetime()}})
                 self._prune_command_history()
                 self.async_update_listeners()
         except ConfigEntryAuthFailed as e:
