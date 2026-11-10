@@ -128,7 +128,7 @@ class MqttClientMod(mqtt.Client):
 class StellantisBase:
     def __init__(self, hass: HomeAssistant) -> None:
         self._hass = hass
-        self._config = {}
+        self._ = {}
         self._session = None
         self.otp = None
         self._shutting_down = False
@@ -150,7 +150,7 @@ class StellantisBase:
     def set_mobile_app(self, mobile_app, country_code):
         if mobile_app in MOBILE_APPS:
             app_data = deepcopy(MOBILE_APPS[mobile_app])
-            del app_data["configs"]
+            del app_data["s"]
             app_data.update(MOBILE_APPS[mobile_app]["configs"][country_code])
             self.save_config(app_data)
             self.save_config({
@@ -871,6 +871,14 @@ class StellantisVehicles(StellantisOauth):
             self._mqtt_token_retry = 0
             _LOGGER.warning("Rate limit exceeded, retry after 1 day or check logs and restart integration")
             next_run = get_datetime() + timedelta(days=1)
+        except ConfigEntryAuthFailed as err:
+            # Previously uncaught: the job died here and was never rescheduled,
+            # so the MQTT token silently expired and all command buttons stayed unavailable.
+            self._mqtt_token_retry = 0
+            _LOGGER.error("MQTT token refresh needs re-authentication: %s", err)
+            self.disable_remote_commands()
+            await self.hass_notify("reconfigure_otp")
+            return
         except ConfigException:
             self._mqtt_token_retry = 0
             self.disable_remote_commands()
