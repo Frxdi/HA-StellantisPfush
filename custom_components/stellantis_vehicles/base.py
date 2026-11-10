@@ -223,7 +223,7 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         """ Pending action. """
         if not self._commands_history:
             return False
-        ast_action_id = list(self._commands_history.keys())[-1]
+        last_action_id = list(self._commands_history.keys())[-1]
         last_action = self._commands_history[last_action_id]
         if last_action["updates"]:
             return False

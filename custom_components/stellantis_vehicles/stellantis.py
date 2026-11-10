@@ -128,7 +128,7 @@ class MqttClientMod(mqtt.Client):
 class StellantisBase:
     def __init__(self, hass: HomeAssistant) -> None:
         self._hass = hass
-        self._ = {}
+        self._config = {}
         self._session = None
         self.otp = None
         self._shutting_down = False
