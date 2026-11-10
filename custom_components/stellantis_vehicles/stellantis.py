@@ -150,7 +150,7 @@ class StellantisBase:
     def set_mobile_app(self, mobile_app, country_code):
         if mobile_app in MOBILE_APPS:
             app_data = deepcopy(MOBILE_APPS[mobile_app])
-            del app_data["s"]
+            app_data.pop("s", None)
             app_data.update(MOBILE_APPS[mobile_app]["configs"][country_code])
             self.save_config(app_data)
             self.save_config({
