@@ -78,7 +78,14 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         try:
             new_data = await self._stellantis.get_vehicle_status(self._vehicle)
             if new_data:
-                maintenance = await self._stellantis.get_vehicle_maintenance(self._vehicle)
+                try:
+                    maintenance = await self._stellantis.get_vehicle_maintenance(self._vehicle)
+                except ConfigEntryAuthFailed:
+                    raise
+                except Exception as maint_err:
+                    # A failing maintenance request must not discard a good status response.
+                    _LOGGER.warning("Maintenance request failed, continuing without it: %r", maint_err)
+                    maintenance = {}
                 new_data["maintenance"] = {
                     "mileageBeforeMaintenance": maintenance.get("mileageBeforeMaintenance"),
                     "daysBeforeMaintenance": maintenance.get("daysBeforeMaintenance"),
@@ -87,7 +94,7 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         except ConfigEntryAuthFailed:
             raise
         except Exception as err:
-            _LOGGER.debug("Error communicating with Stellantis API: %s", err)
+            _LOGGER.warning("Error communicating with Stellantis API: %r", err)
             raise UpdateFailed(
                 "Error communicating with Stellantis API, enable debug logging for details"
             ) from err
