@@ -84,7 +84,11 @@ async def async_setup_entry(hass: HomeAssistant, config: ConfigEntry):
     url = f"/stellantis_vehicles/{INTEGRATION_VERSION}/stellantis-vehicle-card.js"
     if url not in hass.data["frontend_extra_module_url"].urls:
         file_path = os.path.join(os.path.dirname(__file__), "frontend", "stellantis-vehicle-card.js")
-        await hass.http.async_register_static_paths([StaticPathConfig(url, str(file_path), False)])
+        try:
+            await hass.http.async_register_static_paths([StaticPathConfig(url, str(file_path), False)])
+        except RuntimeError:
+            # Route already registered by an earlier setup attempt; it stays in the router until restart.
+            _LOGGER.debug("Static path %s is already registered", url)
         add_extra_js_url(hass, url)
 
     return True
